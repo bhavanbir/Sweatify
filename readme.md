@@ -1,3 +1,3 @@
 # Prereqs: 
 npm install -D tailwindcss postcss autoprefixer
-npx tailwindcss init -p
+\n npx tailwindcss init -p
