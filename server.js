@@ -16,15 +16,36 @@ const spotifyApi = new SpotifyWebApi({
   redirectUri: process.env.REDIRECT_URI,
 });
 
+// --- HELPER CONFIGURATION ---
+const WORKOUT_SPLITS = {
+  full_body: ["chest", "lats", "quads", "hamstrings", "shoulders"],
+  upper: ["chest", "lats", "shoulders", "biceps", "triceps"],
+  lower: ["quads", "hamstrings", "glutes", "calves"],
+  push: ["chest", "shoulders", "triceps"],
+  pull: ["lats", "biceps", "traps"],
+  legs: ["quads", "hamstrings", "glutes"],
+  chest_focus: ["chest"],
+  back_focus: ["lats"],
+};
+
+const DIFFICULTY_SCALING = {
+  beginner: { sets: 3, reps: "10-12", exercisesPerGroup: 1 },
+  intermediate: { sets: 4, reps: "10-12", exercisesPerGroup: 2 }, // Higher volume
+  advanced: { sets: 5, reps: "8-10", exercisesPerGroup: 2 }, // High volume + intensity
+};
+
 // --- ROUTES ---
 
-// 1. Spotify Login
 app.get("/login", (req, res) => {
-  const scopes = ["playlist-modify-public", "playlist-modify-private"];
+  // Added 'user-top-read' to access user's music taste
+  const scopes = [
+    "playlist-modify-public",
+    "playlist-modify-private",
+    "user-top-read" 
+  ];
   res.redirect(spotifyApi.createAuthorizeURL(scopes));
 });
 
-// 2. Callback
 app.get("/callback", async (req, res) => {
   const error = req.query.error;
   const code = req.query.code;
@@ -39,7 +60,6 @@ app.get("/callback", async (req, res) => {
     spotifyApi.setAccessToken(accessToken);
     spotifyApi.setRefreshToken(refreshToken);
 
-    // Redirect back to frontend
     res.redirect("http://localhost:5173/?success=true");
   } catch (err) {
     console.error("Error getting Tokens:", err);
@@ -47,51 +67,60 @@ app.get("/callback", async (req, res) => {
   }
 });
 
-// 3. Generate Workout (MuscleWiki API)
+// 1. SMART WORKOUT GENERATOR
 app.get("/workout", async (req, res) => {
-  const { muscle } = req.query; // e.g., "chest"
+  const { split, level } = req.query; // e.g., split="push", level="intermediate"
   
+  const selectedSplit = WORKOUT_SPLITS[split] || WORKOUT_SPLITS.full_body;
+  const settings = DIFFICULTY_SCALING[level] || DIFFICULTY_SCALING.beginner;
+
   try {
-    // Determine target muscle ID (Simplified mapping for MuscleWiki)
-    // In a real app, you might map more muscles or use the API's muscle list
-    const musclePath = muscle || "chest";
+    // We make parallel requests for every muscle group in the split
+    const exercisePromises = selectedSplit.map(async (muscle) => {
+      const options = {
+        method: 'GET',
+        url: `https://musclewiki.p.rapidapi.com/exercises`,
+        params: { category: muscle },
+        headers: {
+          'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
+          'X-RapidAPI-Host': 'musclewiki.p.rapidapi.com'
+        }
+      };
 
-    const options = {
-      method: 'GET',
-      url: `https://musclewiki.p.rapidapi.com/exercises`,
-      params: {category: musclePath}, 
-      headers: {
-        'X-RapidAPI-Key': process.env.RAPIDAPI_KEY,
-        'X-RapidAPI-Host': 'musclewiki.p.rapidapi.com'
+      try {
+        const response = await axios.request(options);
+        // Randomly shuffle the results so it's not the same workout every time
+        const shuffled = response.data.sort(() => 0.5 - Math.random());
+        // Pick specific number of exercises based on difficulty
+        const selected = shuffled.slice(0, settings.exercisesPerGroup);
+
+        // Format them
+        return selected.map(ex => ({
+          name: ex.exercise_name || ex.name,
+          muscle: muscle,
+          sets: settings.sets,
+          reps: settings.reps
+        }));
+      } catch (err) {
+        console.error(`Failed to fetch ${muscle}`, err);
+        return [];
       }
-    };
+    });
 
-    // Note: If you don't have a RapidAPI key yet, uncomment the mock data below and comment out the axios call
-    const response = await axios.request(options);
-    const exercises = response.data.slice(0, 5); // Take top 5 exercises
+    // Wait for all API calls to finish
+    const results = await Promise.all(exercisePromises);
+    const flatExercises = results.flat();
 
-    /* // MOCK DATA (Use this if API fails)
-    const exercises = [
-        { name: "Bench Press", target: "Chest" },
-        { name: "Push Ups", target: "Chest" },
-        { name: "Dumbbell Flys", target: "Chest" },
-    ];
-    */
+    // Calculate total duration (approx 3 mins per set including rest)
+    const totalSets = flatExercises.reduce((acc, curr) => acc + curr.sets, 0);
+    const totalSeconds = totalSets * 3 * 60; 
 
-    // Calculate arbitrary duration: 3 sets * 45s per set + 60s rest = ~3 mins per exercise
-    const durationPerExercise = 180; // seconds
-    const totalSeconds = exercises.length * durationPerExercise;
-
-    const formattedWorkout = {
-      exercises: exercises.map(ex => ({
-        name: ex.exercise_name || ex.name, // Adjust based on exact API response
-        sets: 3,
-        reps: 10
-      })),
+    res.json({
+      split: split,
+      level: level,
+      exercises: flatExercises,
       totalSeconds: totalSeconds
-    };
-
-    res.json(formattedWorkout);
+    });
 
   } catch (error) {
     console.error(error);
@@ -99,34 +128,45 @@ app.get("/workout", async (req, res) => {
   }
 });
 
-// 4. Generate Playlist
+// 2. PERSONALIZED SPOTIFY GENERATOR
 app.post("/playlist", async (req, res) => {
   const { totalSeconds } = req.body;
 
   try {
-    // 1. Create a Playlist
+    // A. Get User's Top Tracks (Seed Mechanism)
+    // We use this to know what genre/style they actually like
+    const topTracksRes = await spotifyApi.getMyTopTracks({ limit: 5 });
+    const seedTracks = topTracksRes.body.items.map(track => track.id);
+
+    // B. Get Recommendations based on those seeds + High Energy parameters
+    const recommendationRes = await spotifyApi.getRecommendations({
+      seed_tracks: seedTracks.slice(0, 5), // Max 5 seeds allowed
+      min_energy: 0.7,    // High energy
+      min_tempo: 120,     // Fast pace
+      limit: 50           // Get a big pool to choose from
+    });
+
+    const potentialTracks = recommendationRes.body.tracks;
+    
+    // C. Create Playlist
     const me = await spotifyApi.getMe();
-    const playlist = await spotifyApi.createPlaylist(`Sweatify Workout`, {
-      description: `Generated workout playlist for ${Math.round(totalSeconds/60)} minutes.`,
+    const playlist = await spotifyApi.createPlaylist(`Sweatify ${new Date().toLocaleDateString()}`, {
+      description: `A high-energy mix based on your music taste, timed for a ${Math.round(totalSeconds/60)} min workout.`,
       public: false,
     });
 
-    // 2. Find tracks (High Energy / Workout)
-    const trackSearch = await spotifyApi.searchTracks('workout gym high energy', { limit: 20 });
-    const tracks = trackSearch.body.tracks.items;
-
-    // 3. Select tracks to fit duration
+    // D. Fit Duration
     let currentDuration = 0;
     const selectedUris = [];
 
-    for (let track of tracks) {
-      if (currentDuration < totalSeconds * 1000) { // Spotify uses milliseconds
+    for (let track of potentialTracks) {
+      if (currentDuration < totalSeconds * 1000) {
         selectedUris.push(track.uri);
         currentDuration += track.duration_ms;
       }
     }
 
-    // 4. Add to playlist
+    // E. Add to Playlist
     if (selectedUris.length > 0) {
       await spotifyApi.addTracksToPlaylist(playlist.body.id, selectedUris);
     }
