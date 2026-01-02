@@ -6,3 +6,5 @@
 npm install
 ```
 
+## Github Note:
+  - need to use branch modernized-design, should replace main in the future 
